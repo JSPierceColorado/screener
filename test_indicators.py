@@ -1,111 +1,69 @@
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+import logging
+from datetime import datetime, timedelta, timezone
 
-from dotenv import load_dotenv
+import pandas as pd
 
-
-load_dotenv()
-
-
-def _bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+from app.alpaca_client import AlpacaClient, chunks
+from app.config import Settings
+from app.google_sheets import GoogleSheetsClient
+from app.indicators import OUTPUT_COLUMNS, build_row
 
 
-def _int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    return int(value) if value not in (None, "") else default
+LOGGER = logging.getLogger(__name__)
 
 
-def _float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    return float(value) if value not in (None, "") else default
+class Screener:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.alpaca = AlpacaClient(settings)
+        self.sheets = None if settings.dry_run else GoogleSheetsClient(settings)
 
+    def _select_assets(self) -> list[dict]:
+        assets = self.alpaca.get_tradable_assets()
+        if self.settings.symbols_override:
+            wanted = set(self.settings.symbols_override)
+            assets = [asset for asset in assets if asset.get("symbol") in wanted]
+        if self.settings.max_symbols:
+            assets = assets[: self.settings.max_symbols]
+        return assets
 
-@dataclass(frozen=True)
-class Settings:
-    alpaca_api_key: str
-    alpaca_secret_key: str
-    alpaca_trading_base_url: str
-    alpaca_data_base_url: str
-    alpaca_data_feed: str
+    def run(self) -> pd.DataFrame:
+        assets = self._select_assets()
+        symbols = [asset["symbol"] for asset in assets]
+        fundamentals = self.sheets.read_fundamentals() if self.sheets else {}
 
-    google_spreadsheet_id: str
-    google_service_account_json: str
-    google_output_sheet: str
-    google_fundamentals_sheet: str
-    google_run_log_sheet: str
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(days=self.settings.lookback_calendar_days)
+        bars_by_symbol: dict[str, list[dict]] = {}
+        snapshots: dict[str, dict] = {}
 
-    lookback_calendar_days: int
-    symbol_batch_size: int
-    request_timeout_seconds: int
-    request_pause_seconds: float
+        batches = list(chunks(symbols, self.settings.symbol_batch_size))
+        for batch_number, symbol_batch in enumerate(batches, start=1):
+            LOGGER.info(
+                "Fetching batch %s/%s (%s symbols)",
+                batch_number,
+                len(batches),
+                len(symbol_batch),
+            )
+            bars_by_symbol.update(self.alpaca.get_daily_bars(symbol_batch, start, now))
+            snapshots.update(self.alpaca.get_snapshots(symbol_batch))
 
-    symbols_override: tuple[str, ...]
-    max_symbols: int | None
-    dry_run: bool
-    output_csv: str
-    log_level: str
-
-    @classmethod
-    def from_env(cls) -> "Settings":
-        symbols = tuple(
-            item.strip().upper()
-            for item in os.getenv("SYMBOLS", "").split(",")
-            if item.strip()
-        )
-        max_symbols_raw = os.getenv("MAX_SYMBOLS", "").strip()
-
-        settings = cls(
-            alpaca_api_key=os.getenv("ALPACA_API_KEY", "").strip(),
-            alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", "").strip(),
-            alpaca_trading_base_url=os.getenv(
-                "ALPACA_TRADING_BASE_URL", "https://paper-api.alpaca.markets"
-            ).rstrip("/"),
-            alpaca_data_base_url=os.getenv(
-                "ALPACA_DATA_BASE_URL", "https://data.alpaca.markets"
-            ).rstrip("/"),
-            alpaca_data_feed=os.getenv("ALPACA_DATA_FEED", "iex").strip().lower(),
-            google_spreadsheet_id=os.getenv("GOOGLE_SPREADSHEET_ID", "").strip(),
-            google_service_account_json=os.getenv(
-                "GOOGLE_SERVICE_ACCOUNT_JSON", ""
-            ).strip(),
-            google_output_sheet=os.getenv("GOOGLE_OUTPUT_SHEET", "Screener").strip(),
-            google_fundamentals_sheet=os.getenv(
-                "GOOGLE_FUNDAMENTALS_SHEET", "Fundamentals"
-            ).strip(),
-            google_run_log_sheet=os.getenv("GOOGLE_RUN_LOG_SHEET", "Run_Log").strip(),
-            lookback_calendar_days=_int("LOOKBACK_CALENDAR_DAYS", 420),
-            symbol_batch_size=_int("SYMBOL_BATCH_SIZE", 150),
-            request_timeout_seconds=_int("REQUEST_TIMEOUT_SECONDS", 45),
-            request_pause_seconds=_float("REQUEST_PAUSE_SECONDS", 0.15),
-            symbols_override=symbols,
-            max_symbols=int(max_symbols_raw) if max_symbols_raw else None,
-            dry_run=_bool("DRY_RUN", False),
-            output_csv=os.getenv("OUTPUT_CSV", "output/screener.csv").strip(),
-            log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
-        )
-        settings.validate()
-        return settings
-
-    def validate(self) -> None:
-        missing = []
-        if not self.alpaca_api_key:
-            missing.append("ALPACA_API_KEY")
-        if not self.alpaca_secret_key:
-            missing.append("ALPACA_SECRET_KEY")
-        if not self.dry_run:
-            if not self.google_spreadsheet_id:
-                missing.append("GOOGLE_SPREADSHEET_ID")
-            if not self.google_service_account_json:
-                missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
-        if missing:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
-        if self.symbol_batch_size < 1:
-            raise ValueError("SYMBOL_BATCH_SIZE must be at least 1")
-        if self.lookback_calendar_days < 300:
-            raise ValueError("LOOKBACK_CALENDAR_DAYS should be at least 300 for SMA200")
+        rows = [
+            build_row(
+                asset=asset,
+                bars=bars_by_symbol.get(asset["symbol"], []),
+                snapshot=snapshots.get(asset["symbol"]),
+                fundamentals=fundamentals.get(asset["symbol"], {}),
+            )
+            for asset in assets
+        ]
+        frame = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+        if not frame.empty:
+            frame = frame.sort_values(
+                by=["dollar_vol_m", "symbol"],
+                ascending=[False, True],
+                na_position="last",
+            ).reset_index(drop=True)
+        return frame

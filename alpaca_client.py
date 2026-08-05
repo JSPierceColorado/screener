@@ -26,6 +26,21 @@ def main() -> int:
     asset_count = 0
     row_count = 0
     try:
+        if settings.run_only_when_market_open and not settings.force_run:
+            clock = screener.alpaca.get_market_clock()
+            if not clock.get("is_open", False):
+                logger.info(
+                    "Market is closed; skipping refresh. Next open: %s",
+                    clock.get("next_open", "unknown"),
+                )
+                return 0
+            logger.info(
+                "Market is open; scheduled close: %s",
+                clock.get("next_close", "unknown"),
+            )
+        elif settings.force_run:
+            logger.warning("FORCE_RUN is enabled; bypassing the market-open check")
+
         frame = screener.run()
         asset_count = row_count = len(frame)
 
