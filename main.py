@@ -309,7 +309,7 @@ class FMP:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "simple-alpaca-sheets-screener/1.1",
+                "User-Agent": "simple-alpaca-sheets-screener/1.2",
             }
         )
 
@@ -404,6 +404,13 @@ class FMP:
 
         found: dict[str, dict[str, Any]] = {}
         fetched_utc = datetime.now(timezone.utc).isoformat()
+        seen_page_signatures: set[tuple[Any, ...]] = set()
+
+        logging.info(
+            "FMP bulk pagination configured with requested limit=%s and max_pages=%s",
+            self.page_size,
+            self.max_pages,
+        )
 
         for page in range(self.max_pages):
             logging.info("Fetching FMP float data page %s", page + 1)
@@ -414,8 +421,28 @@ class FMP:
             if not isinstance(payload, list):
                 raise RuntimeError("Unexpected FMP shares-float-all response")
             if not payload:
+                logging.info("FMP page %s was empty; pagination complete", page + 1)
                 break
 
+            page_symbols = tuple(
+                str(item.get("symbol", "")).strip().upper()
+                for item in payload
+                if isinstance(item, dict) and item.get("symbol")
+            )
+            signature = (
+                len(payload),
+                page_symbols[:10],
+                page_symbols[-10:],
+            )
+            if signature in seen_page_signatures:
+                logging.warning(
+                    "FMP page %s repeated a previous page; stopping pagination to avoid a loop",
+                    page + 1,
+                )
+                break
+            seen_page_signatures.add(signature)
+
+            matches_before = len(found)
             for item in payload:
                 if not isinstance(item, dict):
                     continue
@@ -441,11 +468,25 @@ class FMP:
                 if candidate_score >= existing_score:
                     found[target] = candidate
 
-            if len(payload) < self.page_size:
+            logging.info(
+                "FMP page %s returned %s rows; added %s matches (%s total)",
+                page + 1,
+                len(payload),
+                len(found) - matches_before,
+                len(found),
+            )
+
+            if len(found) >= len(target_symbols):
+                logging.info("All requested symbols have FMP data; pagination complete")
                 break
+
+            # Do not stop merely because FMP returned fewer rows than the requested
+            # limit. Some account tiers cap the actual response below `limit` while
+            # still exposing additional pages. Continue until an empty or repeated
+            # page is received.
         else:
             logging.warning(
-                "Reached FMP_MAX_PAGES=%s before receiving a short page",
+                "Reached FMP_MAX_PAGES=%s before receiving an empty page",
                 self.max_pages,
             )
 
