@@ -622,9 +622,12 @@ class Sheets:
             max(len(fundamentals) + 100, 1000),
             len(FUNDAMENTALS_COLUMNS),
         )
+        # Preserve any user-managed columns to the right of the generated
+        # Fundamentals data.
+        fundamentals_last_column = column_letter(len(FUNDAMENTALS_COLUMNS))
         self.service.spreadsheets().values().clear(
             spreadsheetId=self.spreadsheet_id,
-            range=f"'{self.fundamentals_title}'!A:Z",
+            range=f"'{self.fundamentals_title}'!A:{fundamentals_last_column}",
             body={},
         ).execute()
 
@@ -706,9 +709,12 @@ class Sheets:
             self.output_title, max(row_count, 1000), max(column_count, 30)
         )
 
+        # The automation owns only its generated output columns. Any columns to
+        # the right are reserved for user formulas and are deliberately untouched.
+        last_column = column_letter(len(OUTPUT_COLUMNS))
         self.service.spreadsheets().values().clear(
             spreadsheetId=self.spreadsheet_id,
-            range=f"'{self.output_title}'!A:AZ",
+            range=f"'{self.output_title}'!A:{last_column}",
             body={},
         ).execute()
 
@@ -729,7 +735,6 @@ class Sheets:
                 body={"majorDimension": "ROWS", "values": block},
             ).execute()
 
-        last_column = column_letter(len(OUTPUT_COLUMNS))
         end_row = max(len(all_values), 2)
         try:
             self.service.spreadsheets().batchUpdate(
@@ -746,17 +751,9 @@ class Sheets:
                             }
                         },
                         {
-                            "setBasicFilter": {
-                                "filter": {
-                                    "range": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": 0,
-                                        "endRowIndex": end_row,
-                                        "startColumnIndex": 0,
-                                        "endColumnIndex": len(OUTPUT_COLUMNS),
-                                    }
-                                }
-                            }
+                            # Remove the header filter/dropdown controls if a prior
+                            # version of the screener added them.
+                            "clearBasicFilter": {"sheetId": sheet_id}
                         },
                         {
                             "repeatCell": {
