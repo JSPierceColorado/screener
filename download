@@ -1,8 +1,10 @@
-.git
-.github
-.venv
-__pycache__
-.pytest_cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
 .env
-output
+service-account.json
+output/
 *.csv
+.DS_Store
