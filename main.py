@@ -73,10 +73,7 @@ FUNDAMENTALS_COLUMNS = [
 ]
 
 OUTPUT_COLUMNS = [
-    "updated_utc",
     "symbol",
-    "name",
-    "exchange",
     "price",
     "close",
     "prev_close",
@@ -95,16 +92,13 @@ OUTPUT_COLUMNS = [
     "week52_high",
     "pos_52w",
     "shares_outstanding",
-    "shares_reported_date",
-    "shares_source",
-    "shares_updated_utc",
     "shares_turnover_pct",
-    "marginable",
-    "shortable",
-    "easy_to_borrow",
-    "fractionable",
-    "data_status",
 ]
+
+# Keep AF and later reserved for user formulas. Clearing the former generated
+# range removes stale headers/data from earlier versions without touching AF+.
+OUTPUT_CLEAR_END_COLUMN = "AE"
+OUTPUT_RESERVED_COLUMN_COUNT = 31
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -704,17 +698,17 @@ class Sheets:
 
     def write_rows(self, rows: list[dict[str, Any]]) -> None:
         row_count = len(rows) + 100
-        column_count = len(OUTPUT_COLUMNS) + 2
+        column_count = max(len(OUTPUT_COLUMNS) + 2, OUTPUT_RESERVED_COLUMN_COUNT)
         sheet_id = self.ensure_sheet(
-            self.output_title, max(row_count, 1000), max(column_count, 30)
+            self.output_title, max(row_count, 1000), column_count
         )
 
-        # The automation owns only its generated output columns. Any columns to
-        # the right are reserved for user formulas and are deliberately untouched.
+        # A:AE was used by prior generated versions, so clear that range to remove
+        # obsolete columns. AF and later are reserved for user formulas.
         last_column = column_letter(len(OUTPUT_COLUMNS))
         self.service.spreadsheets().values().clear(
             spreadsheetId=self.spreadsheet_id,
-            range=f"'{self.output_title}'!A:{last_column}",
+            range=f"'{self.output_title}'!A:{OUTPUT_CLEAR_END_COLUMN}",
             body={},
         ).execute()
 
@@ -833,7 +827,6 @@ def build_row(
     bars: list[dict[str, Any]],
     snapshot: dict[str, Any] | None,
     fundamentals: dict[str, Any] | None,
-    updated_utc: str,
 ) -> dict[str, Any]:
     symbol = str(asset.get("symbol", ""))
     historical = completed_bars(bars)
@@ -884,24 +877,9 @@ def build_row(
         )
 
     shares_outstanding = safe_float(fundamentals.get("shares_outstanding"))
-    shares_reported_date = str(fundamentals.get("reported_date", ""))
-    shares_source = str(fundamentals.get("source", ""))
-    shares_updated_utc = str(fundamentals.get("updated_utc", ""))
-
-    if not historical:
-        data_status = "no_daily_bars"
-    elif len(historical) < 200:
-        data_status = f"insufficient_history_{len(historical)}d"
-    elif price is None:
-        data_status = "no_current_price"
-    else:
-        data_status = "ok"
 
     return {
-        "updated_utc": updated_utc,
         "symbol": symbol,
-        "name": asset.get("name", ""),
-        "exchange": asset.get("exchange", ""),
         "price": price,
         "close": close,
         "prev_close": prev_close,
@@ -920,15 +898,7 @@ def build_row(
         "week52_high": week52_high,
         "pos_52w": pos_52w,
         "shares_outstanding": shares_outstanding,
-        "shares_reported_date": shares_reported_date,
-        "shares_source": shares_source,
-        "shares_updated_utc": shares_updated_utc,
         "shares_turnover_pct": (volume / shares_outstanding * 100.0) if volume is not None and shares_outstanding else None,
-        "marginable": bool(asset.get("marginable", False)),
-        "shortable": bool(asset.get("shortable", False)),
-        "easy_to_borrow": bool(asset.get("easy_to_borrow", False)),
-        "fractionable": bool(asset.get("fractionable", False)),
-        "data_status": data_status,
     }
 
 
@@ -1066,7 +1036,6 @@ def run() -> None:
 
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=lookback_days)
-    updated_utc = now.isoformat()
     all_rows: list[dict[str, Any]] = []
     asset_batches = list(chunks(assets, batch_size))
 
@@ -1089,7 +1058,6 @@ def run() -> None:
                     bars.get(symbol, []),
                     snapshots.get(symbol),
                     fundamentals.get(symbol),
-                    updated_utc,
                 )
             )
 
