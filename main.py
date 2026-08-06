@@ -822,6 +822,28 @@ def completed_bars(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return cleaned
 
 
+def snapshot_current_price(snapshot: dict[str, Any] | None) -> float | None:
+    """Return a usable current-session price from an Alpaca snapshot.
+
+    Deliberately does not use prevDailyBar because that is a prior-session value,
+    not evidence that the symbol currently has market data.
+    """
+    snapshot = snapshot or {}
+    latest_trade = snapshot.get("latestTrade") or {}
+    minute_bar = snapshot.get("minuteBar") or {}
+    daily_bar = snapshot.get("dailyBar") or {}
+
+    for value in (
+        latest_trade.get("p"),
+        minute_bar.get("c"),
+        daily_bar.get("c"),
+    ):
+        price = safe_float(value)
+        if price is not None and price > 0:
+            return price
+    return None
+
+
 def build_row(
     asset: dict[str, Any],
     bars: list[dict[str, Any]],
@@ -833,7 +855,6 @@ def build_row(
     snapshot = snapshot or {}
     fundamentals = fundamentals or {}
 
-    latest_trade = snapshot.get("latestTrade") or {}
     daily_bar = snapshot.get("dailyBar") or {}
     previous_daily_bar = snapshot.get("prevDailyBar") or {}
 
@@ -845,9 +866,7 @@ def build_row(
 
     close = historical_closes[-1] if historical_closes else safe_float(previous_daily_bar.get("c"))
     prev_close = historical_closes[-2] if len(historical_closes) >= 2 else None
-    price = safe_float(latest_trade.get("p"))
-    if price is None:
-        price = safe_float(daily_bar.get("c"))
+    price = snapshot_current_price(snapshot)
     if price is None:
         price = close
 
@@ -1023,10 +1042,12 @@ def run() -> None:
         logging.warning("FORCE_RUN=true; bypassing market-open check")
 
     assets = select_assets(alpaca.tradable_assets())
-    symbols = [str(asset["symbol"]) for asset in assets]
-    logging.info("Processing %s active tradable U.S. equities", len(symbols))
+    candidate_count = len(assets)
+    logging.info(
+        "Checking current prices for %s active tradable U.S. equities",
+        candidate_count,
+    )
 
-    fundamentals = refresh_fundamentals(sheets, symbols)
     lookback_days = env_int("LOOKBACK_CALENDAR_DAYS", 420)
     batch_size = env_int("SYMBOL_BATCH_SIZE", 150)
     if lookback_days < 300:
@@ -1034,21 +1055,57 @@ def run() -> None:
     if batch_size < 1:
         raise ValueError("SYMBOL_BATCH_SIZE must be at least 1")
 
+    # Fetch snapshots first. Symbols without a usable current-session price are
+    # excluded before SEC matching and before the much heavier historical-bars
+    # requests. The snapshots are retained and reused when building the rows.
+    snapshots_by_symbol: dict[str, dict[str, Any]] = {}
+    eligible_assets: list[dict[str, Any]] = []
+    candidate_batches = list(chunks(assets, batch_size))
+    for batch_number, asset_batch in enumerate(candidate_batches, start=1):
+        batch_symbols = [str(asset["symbol"]) for asset in asset_batch]
+        logging.info(
+            "Checking price batch %s/%s (%s symbols)",
+            batch_number,
+            len(candidate_batches),
+            len(batch_symbols),
+        )
+        batch_snapshots = alpaca.snapshots(batch_symbols)
+        for asset in asset_batch:
+            symbol = str(asset["symbol"])
+            snapshot = batch_snapshots.get(symbol)
+            if snapshot_current_price(snapshot) is None:
+                continue
+            eligible_assets.append(asset)
+            snapshots_by_symbol[symbol] = snapshot or {}
+
+    excluded_count = candidate_count - len(eligible_assets)
+    logging.info(
+        "Current-price check kept %s symbols and excluded %s with no usable price",
+        len(eligible_assets),
+        excluded_count,
+    )
+    if not eligible_assets:
+        logging.warning("No symbols returned a usable current price; writing an empty screener")
+        sheets.write_rows([])
+        return
+
+    symbols = [str(asset["symbol"]) for asset in eligible_assets]
+    fundamentals = refresh_fundamentals(sheets, symbols)
+
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=lookback_days)
     all_rows: list[dict[str, Any]] = []
-    asset_batches = list(chunks(assets, batch_size))
+    asset_batches = list(chunks(eligible_assets, batch_size))
 
     for batch_number, asset_batch in enumerate(asset_batches, start=1):
         batch_symbols = [str(asset["symbol"]) for asset in asset_batch]
         logging.info(
-            "Fetching batch %s/%s (%s symbols)",
+            "Fetching historical batch %s/%s (%s symbols)",
             batch_number,
             len(asset_batches),
             len(batch_symbols),
         )
         bars = alpaca.daily_bars(batch_symbols, start, now)
-        snapshots = alpaca.snapshots(batch_symbols)
 
         for asset in asset_batch:
             symbol = str(asset["symbol"])
@@ -1056,7 +1113,7 @@ def run() -> None:
                 build_row(
                     asset,
                     bars.get(symbol, []),
-                    snapshots.get(symbol),
+                    snapshots_by_symbol.get(symbol),
                     fundamentals.get(symbol),
                 )
             )
